@@ -95,6 +95,26 @@ mod config recipes moderne sync
    python main.py
    ```
 
+## Starting the MCP Server
+
+To start the MCP server with a virtual environment:
+
+```bash
+source venv/bin/activate && python3 main.py --help
+```
+
+Or if you prefer to run the server without the virtual environment:
+
+```bash
+python3 main.py
+```
+
+To see available commands and options:
+
+```bash
+python main.py --help
+```
+
 ## Tools
 
 - **`sync_repo`**: Sync a public git repository to your local workspace.
