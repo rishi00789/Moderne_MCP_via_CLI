@@ -51,13 +51,30 @@ def _sync_repo(repo_url: str, branch: str = "main", force_clean: bool = True, se
         run_command(["rm", "-rf", MODERNE_WORKSPACE])
         
     os.makedirs(MODERNE_WORKSPACE, exist_ok=True)
+    
+    # Parse org and repo from URL for better CSV structure
+    # Expected URL: https://github.com/org/repo.git or similar
+    parts = repo_url.rstrip("/").replace(".git", "").split("/")
+    repo_name = parts[-1]
+    org_name = parts[-2] if len(parts) >= 2 else "default"
+
     temp_csv = f"/tmp/mcp_repos_{session_id or uuid.uuid4()}.csv"
     try:
         with open(temp_csv, "w") as f:
-            f.write("cloneUrl,branch\n")
-            f.write(f"{repo_url},{branch}\n")
-        output = run_command(["mod", "git", "sync", "csv", "--with-sources", MODERNE_WORKSPACE, temp_csv])
-        return f"Successfully synced {repo_url}.\n{output}"
+            # Using more columns helps Moderne CLI understand the structure
+            f.write("org1,repo,branch,cloneUrl\n")
+            f.write(f"{org_name},{repo_name},{branch},{repo_url}\n")
+        
+        try:
+            output = run_command(["mod", "git", "sync", "csv", "--with-sources", MODERNE_WORKSPACE, temp_csv])
+            return f"Successfully synced {repo_url}.\n{output}"
+        except Exception as e:
+            # Resilience check: If sync failed but the directory actually exists, we might still be okay
+            expected_path = os.path.join(MODERNE_WORKSPACE, org_name, repo_name)
+            if os.path.exists(expected_path) and os.path.exists(os.path.join(expected_path, ".git")):
+                logger.warning(f"Mod sync reported failure, but repository found at {expected_path}. Continuing...")
+                return f"Sync reported issues but repository found.\n{str(e)}"
+            raise e
     finally:
         if os.path.exists(temp_csv):
             os.remove(temp_csv)
@@ -156,22 +173,28 @@ def _ai_recommend_recipes(goal: str, project_files: dict) -> str:
     common_recipes = [r['id'] for r in recipes[:100]]
     
     prompt = f"""
-    Analyze the following project files and suggest the best OpenRewrite recipes to achieve the goal: "{goal}"
+    You are a Senior Java Migration Architect. Analyze the following project context and suggest a comprehensive set of OpenRewrite recipes to achieve the goal: "{goal}"
     
-    Project Files:
+    PROJECT CONTEXT:
+    ----------------
+    Project Files & Structure:
     {json.dumps(project_files, indent=2)}
     
-    Available Example Recipes (Commonly used):
+    AVAILABLE RECIPES (Examples):
+    -----------------------------
     {", ".join(common_recipes)}
     
-    CRITICAL: 
-    1. Prefer standard official recipes starting with 'org.openrewrite' over 'io.moderne.devcenter' templates unless strictly necessary.
-    2. MANY recipes require parameters. For the following recipes, YOU MUST use these EXACT keys:
-       - 'org.openrewrite.maven.UpgradeParentVersion': MUST use 'groupId', 'artifactId', 'newVersion'
-       - 'org.openrewrite.maven.UpgradeDependencyVersion': MUST use 'groupId', 'artifactId', 'newVersion'
-       - 'org.openrewrite.maven.ChangePropertyValue': MUST use 'key', 'newValue' (for pom.xml property updates)
-       - 'org.openrewrite.java.migrate.UpgradeJavaVersion': MUST use 'version'
-    3. You MUST provide the necessary parameters for each recipe in the 'options' field.
+    INSTRUCTIONS:
+    -------------
+    1. ANALYZE THE STACK: Based on the files provided (especially pom.xml and the file tree), identify the current versions of Java, Spring Boot, JUnit, and other major frameworks.
+    2. TARGETED MIGRATION: If the goal is a Java version upgrade (e.g., "Java 11"), suggest NOT ONLY the version change recipe, but also the necessary migration recipes (e.g., JUnit 4 to 5, JAXB, etc.) and dependency upgrades that are typically required for that version.
+    3. PREFER STANDARDS: Use official 'org.openrewrite' recipes over 'io.moderne.devcenter' templates unless a standard one doesn't exist.
+    4. PARAMETER SCHEMA: Many recipes REQUIRE specific keys. You MUST use these EXACT keys:
+       - 'org.openrewrite.maven.UpgradeParentVersion': 'groupId', 'artifactId', 'newVersion'
+       - 'org.openrewrite.maven.UpgradeDependencyVersion': 'groupId', 'artifactId', 'newVersion'
+       - 'org.openrewrite.maven.ChangePropertyValue': 'key', 'newValue'
+       - 'org.openrewrite.java.migrate.UpgradeJavaVersion': 'version'
+    5. JUSTIFICATION: For each recipe, provide a clear technical justification explaining why it's needed for this specific project and goal.
     
     Return ONLY a JSON object with the following structure:
     {{
@@ -204,6 +227,7 @@ def ai_recommend_recipes(goal: str, project_files: dict) -> str:
 
 def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str = "main", force_clean: bool = False, job_id_internal: Optional[str] = None) -> dict:
     git_logs = []
+    recipe_results = [] # Track results for the final summary
     def log_cmd(args, output):
         git_logs.append(f"CMD: {' '.join(args)}\nOUT: {output}")
 
@@ -220,12 +244,22 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
         
         repo_name = repo_url.split("/")[-1].replace(".git", "")
         repo_path = None
-        for root, dirs, files in os.walk(MODERNE_WORKSPACE):
-            if ".git" in dirs and root.endswith(repo_name):
-                repo_path = root
-                break
+        # Priority search: check the expected path based on our new CSV org/repo logic
+        parts = repo_url.rstrip("/").replace(".git", "").split("/")
+        expected_org = parts[-2] if len(parts) >= 2 else "default"
+        guessed_path = os.path.join(MODERNE_WORKSPACE, expected_org, repo_name)
+        
+        if os.path.exists(guessed_path) and os.path.exists(os.path.join(guessed_path, ".git")):
+            repo_path = guessed_path
+        else:
+            # Fallback to recursive search if structure is different
+            for root, dirs, files in os.walk(MODERNE_WORKSPACE):
+                if ".git" in dirs and root.endswith(repo_name):
+                    repo_path = root
+                    break
+                    
         if not repo_path:
-            raise Exception(f"Repo {repo_name} not found in workspace")
+            raise Exception(f"Repo {repo_name} not found in workspace {MODERNE_WORKSPACE}")
 
         def run_mod_git(args):
             # mod git <cmd> [options] <path> [extra_args]
@@ -261,8 +295,24 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
                 pom_content = f.read()
         
         # 5. Recommendation
-        update_progress("Step 5/8: Getting AI recipe recommendations...")
-        ai_resp_raw = _ai_recommend_recipes(goal, {"pom.xml": pom_content})
+        update_progress("Step 5/8: Analyzing project context for AI...")
+        
+        # Gather file tree (excluding noise)
+        file_tree = []
+        for root, dirs, files in os.walk(repo_path):
+            # Prune noisy directories
+            dirs[:] = [d for d in dirs if d not in [".git", "target", ".idea", ".vscode", ".moderne"]]
+            for f in files:
+                rel_path = os.path.relpath(os.path.join(root, f), repo_path)
+                file_tree.append(rel_path)
+        
+        project_context = {
+            "file_tree_summary": file_tree[:200], # Top 200 files for context
+            "pom.xml": pom_content
+        }
+
+        update_progress("Step 5.1/8: Getting AI recipe recommendations...")
+        ai_resp_raw = _ai_recommend_recipes(goal, project_context)
         log_cmd(["ai_recommend"], ai_resp_raw)
         
         try:
@@ -305,6 +355,16 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
         for i, r_obj in enumerate(final_recipes):
             r_id = r_obj.get("id")
             r_options = r_obj.get("options", {})
+            r_justification = r_obj.get("justification", "No justification provided.")
+            
+            # Initial status
+            current_res = {
+                "id": r_id,
+                "justification": r_justification,
+                "status": "PENDING",
+                "details": ""
+            }
+            recipe_results.append(current_res)
             
             # Skip redundant or problematic AI recipes if we already have the primary migrate one
             # (Safety check for redundant java versioning plugins)
@@ -344,6 +404,8 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
                 msg = f"FAILED RUN: {r_id} execution failed."
                 logger.warning(f"{msg} Error: {error_summary}")
                 git_logs.append(f"FAILED RUN: {r_id} ({error_summary})")
+                current_res["status"] = "FAILED"
+                current_res["details"] = error_summary
                 continue
             
             # Extract specific Run ID from output
@@ -354,8 +416,12 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
                 # Might be search result or just no changes
                 if "search.patch" in run_out:
                     git_logs.append(f"SKIPPED: {r_id} produced SEARCH results only")
+                    current_res["status"] = "SKIPPED"
+                    current_res["details"] = "Produced search results only (no modifications)."
                 else:
                     git_logs.append(f"SKIPPED: {r_id} produced no code changes")
+                    current_res["status"] = "SKIPPED"
+                    current_res["details"] = "No changes were recommended for this repository."
                 continue
                 
             run_id = run_id_match.group(1)
@@ -385,6 +451,8 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
                     # 4. Commit locally
                     run_git_raw(["git", "commit", "-m", f"Moderne Auto-Fix: Applied {r_id}"])
                     git_logs.append(f"APPLIED AND COMMITTED: {r_id} (Run {run_id})")
+                    current_res["status"] = "APPLIED"
+                    current_res["details"] = f"Successfully applied and committed (Run: {run_id})."
                     
                     # 5. REBUILD LST: Critical for cumulative changes!
                     try:
@@ -396,15 +464,60 @@ def _full_automate_fix(repo_url: str, goal: str, branch_name: str, branch: str =
                         msg = f"ROLLBACK: {r_id} broke the build. Reverting changes."
                         logger.warning(f"{msg} Error: {error_summary}")
                         git_logs.append(f"FAILED BUILD: {msg} ({error_summary})")
+                        current_res["status"] = "BROKEN BUILD (ROLLED BACK)"
+                        current_res["details"] = f"Recipe broke the build: {error_summary}. Changes reverted."
                         # Revert last commit
                         run_git_raw(["git", "reset", "--hard", "HEAD~1"])
                         continue
                 else:
                     git_logs.append(f"SKIPPED COMMIT: No net changes for {r_id}")
+                    current_res["status"] = "SKIPPED"
+                    current_res["details"] = "Recipe produced no net changes after applying filters."
             
         # 7. Doc gen
         update_progress("Step 7/8: Generating fix summary documentation...")
-        summary_content = f"# Moderne Fix Summary\nGoal: {goal}\nApplied Recipes:\n" + "\n".join([f"- {r['id']}" for r in final_recipes]) + f"\n\n## AI Analysis\n{ai_resp_raw}"
+        
+        # Build visually stimulating Markdown table
+        table_rows = []
+        for res in recipe_results:
+            status_icon = "⚪"
+            if res["status"] == "APPLIED": status_icon = "✅"
+            elif res["status"] == "SKIPPED": status_icon = "⚠️"
+            elif "FAILED" in res["status"] or "BROKEN" in res["status"]: status_icon = "❌"
+            
+            table_rows.append(f"| {status_icon} **{res['status']}** | `{res['id']}` | {res['justification']} |")
+
+        summary_content = f"""# 🚀 Moderne Automation Fix Summary
+
+> [!IMPORTANT]
+> This branch was automatically generated by the Moderne CLI AI Automation to achieve the following goal:
+> **"{goal}"**
+
+## 📊 Transformation Overview
+
+| Status | Recipe | Purpose / Justification |
+| :--- | :--- | :--- |
+{"\n".join(table_rows)}
+
+## 📝 Execution Details
+
+### Applied Changes
+{chr(10).join([f"- **{r['id']}**: {r['details']}" for r in recipe_results if r['status'] == 'APPLIED']) or "No recipes were successfully applied."}
+
+### Skipped or Failed Items
+{chr(10).join([f"- **{r['id']}** ({r['status']}): {r['details']}" for r in recipe_results if r['status'] != 'APPLIED']) or "No recipes were skipped or failed."}
+
+---
+
+## 💡 What's Next?
+
+1. **Review the Changes**: Inspect the files modified in this commit.
+2. **Run Tests**: Verify that the transformation preserves your business logic.
+3. **Merge**: Once satisfied, merge this branch into your main development line.
+
+---
+*Generated by Moderne CLI MCP Automation on {time.strftime('%Y-%m-%d %H:%M:%S')}*
+"""
         summary_path = os.path.join(repo_path, "MODERNE_FIX_SUMMARY.md")
         with open(summary_path, "w") as f:
             f.write(summary_content)
